@@ -392,6 +392,15 @@ code.kbd { background: var(--input-bg); border: 1px solid var(--border); border-
         <div class="hero-meta" id="dashBalanceMeta"></div>
       </div>
     </div>
+    <div class="card">
+      <h3>My accounts
+        <span style="display:flex;gap:12px">
+          <button class="link-btn compact" data-transfer>🔀 Transfer</button>
+          <button class="link-btn compact" data-addacc>＋ Add</button>
+        </span>
+      </h3>
+      <div id="dashAccounts"></div>
+    </div>
     <div class="grid-2">
       <div class="stat-card"><div class="stat-label">📥 Income this month</div><div class="stat-value pos" id="dashIncome"></div></div>
       <div class="stat-card"><div class="stat-label">📤 Expenses this month</div><div class="stat-value neg" id="dashExpenses"></div></div>
@@ -458,6 +467,16 @@ code.kbd { background: var(--input-bg); border: 1px solid var(--border); border-
           <label for="txCategory">Category</label>
           <select id="txCategory"></select>
           <div class="err">Choose a category.</div>
+        </div>
+        <div class="field" id="f-txAccount">
+          <label for="txAccount" id="txAccountLabel">Account</label>
+          <select id="txAccount"></select>
+          <div class="err">Pick an account.</div>
+        </div>
+        <div class="field" id="f-txAccountTo" style="display:none">
+          <label for="txAccountTo">To account</label>
+          <select id="txAccountTo"></select>
+          <div class="err">Pick a different account to transfer to.</div>
         </div>
         <div class="field-row">
           <div class="field">
@@ -560,17 +579,14 @@ code.kbd { background: var(--input-bg); border: 1px solid var(--border); border-
     <div class="card">
       <h3>👤 Profile &amp; Accounts</h3>
       <div class="field"><label for="setName">Display name</label><input type="text" id="setName" maxlength="30" placeholder="Your name"></div>
-      <div class="field-row">
-        <div class="field"><label for="setCurrency">Currency</label>
-          <select id="setCurrency">
-            <option value="GBP">£ GBP — British Pound</option>
-            <option value="USD">$ USD — US Dollar</option>
-            <option value="EUR">€ EUR — Euro</option>
-            <option value="JPY">¥ JPY — Japanese Yen</option>
-            <option value="INR">₹ INR — Indian Rupee</option>
-          </select>
-        </div>
-        <div class="field"><label for="setStartBal">Starting balance</label><input type="number" step="0.01" id="setStartBal" inputmode="decimal"></div>
+      <div class="field"><label for="setCurrency">Currency</label>
+        <select id="setCurrency">
+          <option value="GBP">£ GBP — British Pound</option>
+          <option value="USD">$ USD — US Dollar</option>
+          <option value="EUR">€ EUR — Euro</option>
+          <option value="JPY">¥ JPY — Japanese Yen</option>
+          <option value="INR">₹ INR — Indian Rupee</option>
+        </select>
       </div>
       <div id="accountsList"></div>
     </div>
@@ -715,6 +731,7 @@ const INCOME_CATS = [['Salary','💼'],['Freelance','💰'],['Investment','📈'
 const BUDGET_CATS = ['Food','Transport','Entertainment','Gym','Travel','Household','Personal','Health','Subscriptions'];
 const BUDGET_DEFAULTS = { Food: 350, Transport: 150, Entertainment: 100, Gym: 40, Travel: 100, Household: 200, Personal: 80, Health: 50, Subscriptions: 60 };
 const DEBT_TYPES = ['Credit Card','Personal Loan','Car Loan','Student Loan','Mortgage','Other'];
+const ACC_TYPES = { current: ['Current account','🏦'], savings: ['Savings account','💰'], cash: ['Cash','💵'], other: ['Other','🗂️'] };
 const GOAL_TEMPLATES = [
   { name: 'Emergency Fund', emoji: '🛟', target: 6000 }, { name: 'Holiday Fund', emoji: '🏖️', target: 2000 },
   { name: 'House Deposit', emoji: '🏡', target: 30000 }, { name: 'Business Fund', emoji: '🚀', target: 10000 },
@@ -779,6 +796,7 @@ function loadDB() {
       DB.settings.telegram = Object.assign(defaultSettings().telegram, DB.settings.telegram || {});
       for (const k of ['accounts','transactions','bills','debts','savings','goals','snapshots']) if (!Array.isArray(DB[k])) DB[k] = [];
       if (typeof DB.budgets !== 'object' || !DB.budgets) DB.budgets = {};
+      migrateDB();
       return;
     }
   } catch (e) { console.warn('Failed to load data, reseeding.', e); }
@@ -790,6 +808,39 @@ function saveDB() {
   catch (e) { toast('⚠️ Could not save — storage full?'); }
 }
 
+/* v2 migration: accounts hold LIVE balances; every transaction belongs to an account.
+   Old data stored starting balances + a global transaction ledger, so we fold the
+   ledger's net effect into the first account and tag old transactions. Totals are unchanged. */
+function migrateDB() {
+  if (DB.version >= 2) { ensureAccountExists(); return; }
+  if (!DB.accounts.length) {
+    DB.accounts.push({ id: uid(), name: 'Main account', type: 'current', balance: Number(DB.settings.startingBalance) || 0 });
+  }
+  const net = DB.transactions.reduce((s, t) => s + txSigned(t), 0);
+  DB.accounts[0].balance = Math.round(((Number(DB.accounts[0].balance) || 0) + net) * 100) / 100;
+  for (const a of DB.accounts) if (!a.type) a.type = /sav/i.test(a.name) ? 'savings' : 'current';
+  for (const t of DB.transactions) if (!t.accountId) t.accountId = DB.accounts[0].id;
+  DB.version = 2;
+  saveDB();
+}
+function ensureAccountExists() {
+  if (!DB.accounts.length) {
+    DB.accounts.push({ id: uid(), name: 'Main account', type: 'current', balance: 0 });
+    saveDB();
+  }
+}
+function accountById(id) { return DB.accounts.find(a => a.id === id); }
+function defaultAccountId() { return DB.accounts[0]?.id; }
+/* Apply (dir=+1) or reverse (dir=-1) a transaction's effect on account balances */
+function applyTxToAccounts(t, dir) {
+  const a = accountById(t.accountId);
+  if (a) a.balance = Math.round((a.balance + dir * (t.type === 'income' ? t.amount : -t.amount)) * 100) / 100;
+  if (t.type === 'transfer') {
+    const b = accountById(t.toAccountId);
+    if (b) b.balance = Math.round((b.balance + dir * t.amount) * 100) / 100;
+  }
+}
+
 /* ---------- Demo data ---------- */
 function seedDemoData() {
   const t = new Date();
@@ -799,9 +850,9 @@ function seedDemoData() {
   s.name = 'Jean'; s.startingBalance = 4335.72;
   const db = {
     accounts: [
-      { id: uid(), name: 'Monzo Current', balance: 2140.50 },
-      { id: uid(), name: 'Barclays Everyday', balance: 895.22 },
-      { id: uid(), name: 'Chase Saver', balance: 1300.00 },
+      { id: uid(), name: 'Monzo Current', type: 'current', balance: 2140.50 },
+      { id: uid(), name: 'Barclays Everyday', type: 'current', balance: 895.22 },
+      { id: uid(), name: 'Chase Saver', type: 'savings', balance: 1300.00 },
     ],
     transactions: [
       { id: uid(), type: 'income',  amount: 2650.00, category: 'Salary', description: 'Monthly salary', date: ago(13) },
@@ -836,6 +887,13 @@ function seedDemoData() {
     settings: s,
     snapshots: [],
   };
+  // Apply demo transactions to the first account so balances are live (v2 model)
+  const mainAcc = db.accounts[0];
+  for (const t of db.transactions) {
+    t.accountId = mainAcc.id;
+    mainAcc.balance = Math.round((mainAcc.balance + (t.type === 'income' ? t.amount : -t.amount)) * 100) / 100;
+  }
+  db.version = 2;
   // Historic snapshots (last 6 months) for charts
   let nw = 9000, debt = 9100, sav = 6900;
   for (let i = 6; i >= 1; i--) {
@@ -855,8 +913,10 @@ function txSigned(t) {
   return -t.amount; // expense, savings, debt payment all leave the current account
 }
 function totalBalance() {
-  const start = DB.accounts.reduce((s, a) => s + (Number(a.balance) || 0), 0) || Number(DB.settings.startingBalance) || 0;
-  return start + DB.transactions.reduce((s, t) => s + txSigned(t), 0);
+  return DB.accounts.reduce((s, a) => s + (Number(a.balance) || 0), 0);
+}
+function savingsAccountsTotal() {
+  return DB.accounts.filter(a => a.type === 'savings').reduce((s, a) => s + (Number(a.balance) || 0), 0);
 }
 function totalSavings() { return DB.goals.reduce((s, g) => s + (Number(g.current) || 0), 0); }
 function totalDebt() { return DB.debts.reduce((s, d) => s + (Number(d.balance) || 0), 0); }
@@ -1113,6 +1173,21 @@ RENDERERS.home = function renderHome() {
 
   $('#dashBalance').textContent = fmt(totalBalance());
   $('#dashBalanceMeta').textContent = `across ${DB.accounts.length || 1} account${DB.accounts.length === 1 ? '' : 's'}`;
+
+  // Accounts card
+  $('#dashAccounts').innerHTML = DB.accounts.map(a => `
+    <div class="list-item">
+      <div class="li-icon">${ACC_TYPES[a.type]?.[1] || '🏦'}</div>
+      <div class="li-main">
+        <div class="li-title">${esc(a.name)}</div>
+        <div class="li-sub">${ACC_TYPES[a.type]?.[0] || 'Account'}</div>
+      </div>
+      <div class="li-right"><div class="li-amount ${a.balance < 0 ? 'neg' : ''}">${fmt(a.balance)}</div></div>
+      <button class="mini-actions" data-editacc="${a.id}" style="background:none" aria-label="Edit account"><span style="width:38px;height:38px;border-radius:10px;background:var(--input-bg);display:grid;place-items:center">✏️</span></button>
+    </div>`).join('') || '<div class="empty-state"><p>No accounts — add one to get started.</p></div>';
+  const savTot = savingsAccountsTotal();
+  if (savTot > 0) $('#dashAccounts').insertAdjacentHTML('beforeend',
+    `<div class="tiny mt-6" style="text-align:right">of which savings accounts: <strong>${fmt(savTot)}</strong></div>`);
   const inc = monthIncome(), exp = monthExpenses();
   $('#dashIncome').textContent = fmt0(inc);
   $('#dashExpenses').textContent = fmt0(exp);
@@ -1168,8 +1243,9 @@ RENDERERS.home = function renderHome() {
       <div class="li-icon">${CAT_ICON[b.category] || '📋'}</div>
       <div class="li-main"><div class="li-title">${esc(b.name)}</div><div class="li-sub">Due ${billDueDate(b).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}</div></div>
       <div class="li-right"><div class="li-amount">${fmt(b.amount)}</div>${badge}</div>
+      <label class="switch" title="Mark paid"><input type="checkbox" data-billpaid="${b.id}"><i></i></label>
     </div>`;
-  }).join('') : `<div class="empty-state"><div class="es-ico">🌤️</div><p>Nothing due in the next 7 days.</p></div>`;
+  }).join('') : `<div class="empty-state"><div class="es-ico">🌤️</div><p>Nothing due in the next 7 days. Tick bills off here as you pay them.</p></div>`;
 
   // Recent transactions
   const recent = [...DB.transactions].sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id)).slice(0, 5);
@@ -1194,6 +1270,21 @@ function catsForType(type) {
 function fillTxCategories() {
   const sel = $('#txCategory');
   sel.innerHTML = catsForType(txType).map(([n, e]) => `<option value="${esc(n)}">${e} ${esc(n)}</option>`).join('');
+  fillTxAccounts();
+}
+function fillTxAccounts() {
+  const prev = $('#txAccount').value;
+  const opts = DB.accounts.map(a => `<option value="${a.id}">${ACC_TYPES[a.type]?.[1] || '🏦'} ${esc(a.name)} · ${fmt(a.balance)}</option>`).join('');
+  $('#txAccount').innerHTML = opts;
+  if (prev && accountById(prev)) $('#txAccount').value = prev;
+  $('#txAccountTo').innerHTML = opts;
+  const isTransfer = txType === 'transfer';
+  $('#f-txAccountTo').style.display = isTransfer ? '' : 'none';
+  $('#txAccountLabel').textContent = isTransfer ? 'From account' : 'Account';
+  if (isTransfer && DB.accounts.length > 1) {
+    const other = DB.accounts.find(a => a.id !== $('#txAccount').value);
+    if (other) $('#txAccountTo').value = other.id;
+  }
 }
 $('#txTypeSeg').addEventListener('click', e => {
   const b = e.target.closest('button[data-type]');
@@ -1235,10 +1326,11 @@ RENDERERS.transactions = function renderTransactions() {
   if (txFilterVal !== 'all' && !months.includes(txFilterVal)) txFilterVal = 'all';
   $('#txFilter').value = txFilterVal;
 
+  // Running balance: walk backwards from today's live total
   const sorted = [...DB.transactions].sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
-  const start = DB.accounts.reduce((s, a) => s + (Number(a.balance) || 0), 0) || Number(DB.settings.startingBalance) || 0;
-  let bal = start;
-  const withBal = sorted.map(t => { bal += txSigned(t); return { t, bal }; });
+  const withBal = new Array(sorted.length);
+  let bal = totalBalance();
+  for (let i = sorted.length - 1; i >= 0; i--) { withBal[i] = { t: sorted[i], bal }; bal -= txSigned(sorted[i]); }
   const filtered = withBal.filter(x => txFilterVal === 'all' || x.t.date.startsWith(txFilterVal)).reverse();
 
   if (!filtered.length) {
@@ -1267,13 +1359,18 @@ $('#txForm').addEventListener('submit', e => {
   const ok = validateFields([
     ['f-txAmount', () => amount > 0 && isFinite(amount)],
     ['f-txCategory', () => $('#txCategory').value],
+    ['f-txAccount', () => $('#txAccount').value],
+    ['f-txAccountTo', () => txType !== 'transfer' || ($('#txAccountTo').value && $('#txAccountTo').value !== $('#txAccount').value)],
     ['f-txDate', () => $('#txDate').value],
   ]);
   if (!ok) return;
   const t = {
     id: uid(), type: txType, amount: Math.round(amount * 100) / 100,
     category: $('#txCategory').value, description: $('#txDesc').value.trim(), date: $('#txDate').value,
+    accountId: $('#txAccount').value,
   };
+  if (txType === 'transfer') t.toAccountId = $('#txAccountTo').value;
+  applyTxToAccounts(t, +1);
   DB.transactions.push(t);
   // Side effects: savings contributions grow goals; debt payments shrink debts
   if (txType === 'savings') {
@@ -1300,6 +1397,7 @@ document.addEventListener('click', e => {
   confirmDialog('Delete transaction?', `${TX_TYPES[t.type]} · ${t.description || t.category} · ${fmt(t.amount)}. This can't be undone.`, () => {
     if (t.type === 'savings') { const g = DB.goals.find(g => g.name === t.category); if (g) g.current = Math.max(0, g.current - t.amount); }
     if (t.type === 'debt') { const d = DB.debts.find(d => d.name === t.category); if (d) d.balance += t.amount; }
+    applyTxToAccounts(t, -1);
     DB.transactions = DB.transactions.filter(x => x.id !== id);
     saveDB(); ensureSnapshot(); toast('🗑️ Transaction deleted');
     if (RENDERERS[currentSection]) RENDERERS[currentSection]();
@@ -1378,7 +1476,8 @@ document.addEventListener('change', e => {
   const key = monthKey();
   if (t.checked) { if (!bill.paidMonths.includes(key)) bill.paidMonths.push(key); toast(`✅ ${bill.name} marked paid`); }
   else { bill.paidMonths = bill.paidMonths.filter(m => m !== key); toast(`↩️ ${bill.name} marked unpaid`); }
-  saveDB(); RENDERERS.bills();
+  saveDB();
+  if (RENDERERS[currentSection]) RENDERERS[currentSection]();
 });
 
 function billFormModal(bill = null) {
@@ -1631,7 +1730,9 @@ document.addEventListener('click', e => {
       const amt = parseFloat($('#payAmt').value);
       if (!validateFields([['f-payAmt', () => amt > 0 && isFinite(amt)]])) return;
       d.balance = Math.max(0, Math.round((d.balance - amt) * 100) / 100);
-      DB.transactions.push({ id: uid(), type: 'debt', amount: Math.round(amt * 100) / 100, category: d.name, description: `Payment to ${d.creditor}`, date: todayISO() });
+      const payTx = { id: uid(), type: 'debt', amount: Math.round(amt * 100) / 100, category: d.name, description: `Payment to ${d.creditor}`, date: todayISO(), accountId: defaultAccountId() };
+      applyTxToAccounts(payTx, +1);
+      DB.transactions.push(payTx);
       saveDB(); ensureSnapshot(); closeModal();
       toast(d.balance === 0 ? `🎉 ${d.name} fully paid off!` : `✅ Payment of ${fmt(amt)} recorded`);
       RENDERERS.debts();
@@ -1779,7 +1880,9 @@ document.addEventListener('click', e => {
       const amt = parseFloat($('#fundAmt').value);
       if (!validateFields([['f-fundAmt', () => amt > 0 && isFinite(amt)]])) return;
       g.current = Math.round((g.current + amt) * 100) / 100;
-      DB.transactions.push({ id: uid(), type: 'savings', amount: Math.round(amt * 100) / 100, category: g.name, description: `Contribution to ${g.name}`, date: todayISO() });
+      const fundTx = { id: uid(), type: 'savings', amount: Math.round(amt * 100) / 100, category: g.name, description: `Contribution to ${g.name}`, date: todayISO(), accountId: defaultAccountId() };
+      applyTxToAccounts(fundTx, +1);
+      DB.transactions.push(fundTx);
       DB.savings.push({ id: uid(), goal: g.name, amount: amt, date: todayISO() });
       saveDB(); ensureSnapshot(); closeModal();
       toast(g.current >= g.target ? `🎉 ${g.name} complete!` : `✅ ${fmt(amt)} added to ${g.name}`);
@@ -1977,7 +2080,6 @@ document.addEventListener('click', e => {
 RENDERERS.settings = function renderSettings() {
   $('#setName').value = DB.settings.name || '';
   $('#setCurrency').value = DB.settings.currency;
-  $('#setStartBal').value = DB.settings.startingBalance || DB.accounts.reduce((s, a) => s + a.balance, 0);
   $('#setDark').checked = DB.settings.theme === 'dark';
   $('#setAutoLock').value = String(DB.settings.autoLock || 0);
   const n = DB.settings.notifications;
@@ -1988,12 +2090,24 @@ RENDERERS.settings = function renderSettings() {
   $('#tgChat').value = DB.settings.telegram.chatId || '';
   $('#lastBackup').textContent = 'Last backup: ' + (DB.settings.lastBackup ? new Date(DB.settings.lastBackup).toLocaleString('en-GB') : 'never');
 
-  // accounts list
-  $('#accountsList').innerHTML = `<div class="tiny" style="margin:4px 0 6px">Accounts (starting balances)</div>` + DB.accounts.map(a => `
-    <div class="set-row" style="min-height:44px;padding:8px 0">
-      <div class="sr-main"><div class="sr-title" style="font-size:0.85rem">🏦 ${esc(a.name)}</div></div>
+  // accounts list — full management
+  $('#accountsList').innerHTML = `<div class="tiny" style="margin:4px 0 6px">Your accounts · total ${fmt(totalBalance())}</div>` + DB.accounts.map(a => `
+    <div class="set-row" style="min-height:48px;padding:8px 0">
+      <div style="font-size:1.15rem">${ACC_TYPES[a.type]?.[1] || '🏦'}</div>
+      <div class="sr-main">
+        <div class="sr-title" style="font-size:0.88rem">${esc(a.name)}</div>
+        <div class="sr-sub">${ACC_TYPES[a.type]?.[0] || 'Account'}</div>
+      </div>
       <div style="font-weight:700">${fmt(a.balance)}</div>
-    </div>`).join('') || '';
+      <div class="mini-actions">
+        <button data-editacc="${a.id}" aria-label="Edit account">✏️</button>
+        <button data-delacc="${a.id}" aria-label="Delete account">🗑️</button>
+      </div>
+    </div>`).join('') + `
+    <div class="grid-2 mt-10">
+      <button class="btn ghost" data-addacc>＋ Add account</button>
+      <button class="btn ghost" data-transfer>🔀 Transfer</button>
+    </div>`;
 
   // accent dots
   $('#accentDots').innerHTML = ACCENTS.map((a, i) =>
@@ -2012,19 +2126,83 @@ RENDERERS.settings = function renderSettings() {
 };
 
 $('#setName').addEventListener('change', e => { DB.settings.name = e.target.value.trim(); saveDB(); toast('✅ Name saved'); });
-$('#setCurrency').addEventListener('change', e => { DB.settings.currency = e.target.value; saveDB(); toast('✅ Currency updated'); });
-$('#setStartBal').addEventListener('change', e => {
-  const v = parseFloat(e.target.value);
-  if (!isFinite(v)) return;
-  DB.settings.startingBalance = v;
-  if (DB.accounts.length) {
-    // scale to a single adjustment account entry note: keep accounts, treat setting as override only when no accounts
-    const cur = DB.accounts.reduce((s, a) => s + a.balance, 0);
-    const diff = v - cur;
-    if (Math.abs(diff) > 0.004) DB.accounts[0].balance = Math.round((DB.accounts[0].balance + diff) * 100) / 100;
+$('#setCurrency').addEventListener('change', e => { DB.settings.currency = e.target.value; saveDB(); toast('✅ Currency updated'); if (RENDERERS[currentSection]) RENDERERS[currentSection](); });
+
+/* ---------- Account management ---------- */
+function accountFormModal(acc = null) {
+  const isEdit = !!acc;
+  openModal(`
+    <h2>${isEdit ? 'Edit account' : 'Add account'}</h2>
+    ${isEdit ? '<p class="muted mb-10">Changing the balance here is a manual adjustment — use it to sync the app with your real bank balance.</p>' : ''}
+    <form id="accForm" novalidate>
+      <div class="field" id="f-accName"><label>Account name</label><input type="text" id="accName" maxlength="40" placeholder="e.g. Monzo Current" value="${esc(acc?.name || '')}"><div class="err">Give the account a name.</div></div>
+      <div class="field"><label>Type</label>
+        <select id="accType">${Object.entries(ACC_TYPES).map(([k, [label, emoji]]) => `<option value="${k}" ${acc?.type === k ? 'selected' : ''}>${emoji} ${label}</option>`).join('')}</select>
+      </div>
+      <div class="field" id="f-accBal"><label>${isEdit ? 'Current balance' : 'Opening balance'}</label><input type="number" step="0.01" inputmode="decimal" id="accBal" placeholder="0.00" value="${acc ? acc.balance : ''}"><div class="err">Enter a valid number.</div></div>
+      <button type="submit" class="btn block">${isEdit ? 'Save changes' : '＋ Add account'}</button>
+    </form>`);
+  $('#accForm').addEventListener('submit', e => {
+    e.preventDefault();
+    const bal = parseFloat($('#accBal').value);
+    const ok = validateFields([
+      ['f-accName', () => $('#accName').value.trim()],
+      ['f-accBal', () => isFinite(bal)],
+    ]);
+    if (!ok) return;
+    const data = { name: $('#accName').value.trim(), type: $('#accType').value, balance: Math.round(bal * 100) / 100 };
+    if (isEdit) Object.assign(acc, data); else DB.accounts.push({ id: uid(), ...data });
+    saveDB(); ensureSnapshot(); closeModal();
+    toast(isEdit ? '✅ Account updated' : '✅ Account added');
+    if (RENDERERS[currentSection]) RENDERERS[currentSection]();
+  });
+}
+function transferModal() {
+  if (DB.accounts.length < 2) { toast('⚠️ Add a second account to transfer between accounts'); return; }
+  const opts = DB.accounts.map(a => `<option value="${a.id}">${ACC_TYPES[a.type]?.[1] || '🏦'} ${esc(a.name)} · ${fmt(a.balance)}</option>`).join('');
+  openModal(`
+    <h2>🔀 Transfer between accounts</h2>
+    <form id="trForm" novalidate>
+      <div class="field"><label>From</label><select id="trFrom">${opts}</select></div>
+      <div class="field" id="f-trTo"><label>To</label><select id="trTo">${opts}</select><div class="err">Pick a different account.</div></div>
+      <div class="field" id="f-trAmt"><label>Amount</label><input type="number" step="0.01" min="0.01" inputmode="decimal" id="trAmt" class="amount-input" placeholder="0.00"><div class="err">Enter a valid amount.</div></div>
+      <button type="submit" class="btn block">🔀 Transfer</button>
+    </form>`);
+  const second = DB.accounts[1]; if (second) $('#trTo').value = second.id;
+  $('#trAmt').focus();
+  $('#trForm').addEventListener('submit', e => {
+    e.preventDefault();
+    const amt = parseFloat($('#trAmt').value);
+    const ok = validateFields([
+      ['f-trTo', () => $('#trTo').value !== $('#trFrom').value],
+      ['f-trAmt', () => amt > 0 && isFinite(amt)],
+    ]);
+    if (!ok) return;
+    const from = accountById($('#trFrom').value), to = accountById($('#trTo').value);
+    const t = { id: uid(), type: 'transfer', amount: Math.round(amt * 100) / 100, category: 'Transfer', description: `${from.name} → ${to.name}`, date: todayISO(), accountId: from.id, toAccountId: to.id };
+    applyTxToAccounts(t, +1);
+    DB.transactions.push(t);
+    saveDB(); ensureSnapshot(); closeModal();
+    toast(`✅ ${fmt(t.amount)} moved to ${to.name}`);
+    if (RENDERERS[currentSection]) RENDERERS[currentSection]();
+  });
+}
+document.addEventListener('click', e => {
+  if (e.target.closest('[data-addacc]')) { accountFormModal(); return; }
+  if (e.target.closest('[data-transfer]')) { transferModal(); return; }
+  const ed = e.target.closest('[data-editacc]');
+  if (ed) { const a = accountById(ed.dataset.editacc); if (a) accountFormModal(a); return; }
+  const del = e.target.closest('[data-delacc]');
+  if (del) {
+    const a = accountById(del.dataset.delacc);
+    if (!a) return;
+    if (DB.accounts.length === 1) { toast('⚠️ You need at least one account'); return; }
+    confirmDialog('Delete account?', `"${a.name}" (${fmt(a.balance)}) will be removed and its balance no longer counted. Past transactions are kept.`, () => {
+      DB.accounts = DB.accounts.filter(x => x.id !== a.id);
+      saveDB(); ensureSnapshot(); toast('🗑️ Account deleted');
+      if (RENDERERS[currentSection]) RENDERERS[currentSection]();
+    });
   }
-  saveDB(); ensureSnapshot(); toast('✅ Starting balance updated');
-  RENDERERS.settings();
 });
 $('#setDark').addEventListener('change', e => { DB.settings.theme = e.target.checked ? 'dark' : 'light'; saveDB(); applyTheme(); });
 document.addEventListener('click', e => {
@@ -2103,9 +2281,9 @@ function download(filename, text, type = 'text/plain') {
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
 $('#exportCsvBtn').addEventListener('click', () => {
-  const rows = [['Date','Type','Category','Description','Amount']];
+  const rows = [['Date','Type','Category','Account','Description','Amount']];
   for (const t of [...DB.transactions].sort((a, b) => a.date.localeCompare(b.date))) {
-    rows.push([t.date, TX_TYPES[t.type], t.category, t.description || '', (t.type === 'income' ? '' : '-') + t.amount.toFixed(2)]);
+    rows.push([t.date, TX_TYPES[t.type], t.category, accountById(t.accountId)?.name || '', t.description || '', (t.type === 'income' ? '' : '-') + t.amount.toFixed(2)]);
   }
   const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
   download(`transactions-${todayISO()}.csv`, csv, 'text/csv');
