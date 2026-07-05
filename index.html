@@ -2139,17 +2139,22 @@ function accountFormModal(acc = null) {
       <div class="field"><label>Type</label>
         <select id="accType">${Object.entries(ACC_TYPES).map(([k, [label, emoji]]) => `<option value="${k}" ${acc?.type === k ? 'selected' : ''}>${emoji} ${label}</option>`).join('')}</select>
       </div>
-      <div class="field" id="f-accBal"><label>${isEdit ? 'Current balance' : 'Opening balance'}</label><input type="number" step="0.01" inputmode="decimal" id="accBal" placeholder="0.00" value="${acc ? acc.balance : ''}"><div class="err">Enter a valid number.</div></div>
+      <div class="field" id="f-accBal"><label>${isEdit ? 'Current balance' : 'Opening balance'}</label><input type="number" step="0.01" min="0" inputmode="decimal" id="accBal" placeholder="0.00" value="${acc ? Math.abs(acc.balance) : ''}"><div class="err">Enter a valid number.</div></div>
+      <div class="set-row" style="border:none;padding:0 0 14px">
+        <div class="sr-main"><div class="sr-title">In overdraft (negative)</div><div class="sr-sub">Turn on if this account is overdrawn — no minus sign needed</div></div>
+        <label class="switch"><input type="checkbox" id="accNeg" ${acc && acc.balance < 0 ? 'checked' : ''}><i></i></label>
+      </div>
       <button type="submit" class="btn block">${isEdit ? 'Save changes' : '＋ Add account'}</button>
     </form>`);
   $('#accForm').addEventListener('submit', e => {
     e.preventDefault();
-    const bal = parseFloat($('#accBal').value);
+    let bal = parseFloat($('#accBal').value);
     const ok = validateFields([
       ['f-accName', () => $('#accName').value.trim()],
-      ['f-accBal', () => isFinite(bal)],
+      ['f-accBal', () => isFinite(bal) && bal >= 0],
     ]);
     if (!ok) return;
+    if ($('#accNeg').checked) bal = -bal;
     const data = { name: $('#accName').value.trim(), type: $('#accType').value, balance: Math.round(bal * 100) / 100 };
     if (isEdit) Object.assign(acc, data); else DB.accounts.push({ id: uid(), ...data });
     saveDB(); ensureSnapshot(); closeModal();
